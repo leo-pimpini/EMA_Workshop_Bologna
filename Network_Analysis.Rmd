@@ -1,0 +1,431 @@
+---
+title: "Network Analysis (mlVAR) — Step-by-step"
+author: "Leo Pimpini"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+# ---- Workshop-friendly defaults ----
+# If you see an error about renv/activate.R, it is coming from your USER or PROJECT .Rprofile,
+# not from this document. Fix by removing/commenting out any `source("renv/activate.R")`
+# in startup files, or by creating renv via renv::init().
+
+Sys.setenv(RENV_CONFIG_AUTOLOADER_ENABLED = "FALSE")
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+
+options(stringsAsFactors = FALSE)
+```
+
+## Overview
+
+This document reproduces the analysis pipeline in the attached script step by step:
+
+- Descriptives and distributions  
+- Missingness diagnostics  
+- Stationarity check with detrending  
+- Participant exclusions (few observations; zero variance flagged)  
+- Estimation of contemporaneous, temporal, and between-subject (BS) networks using `mlVAR`  
+- Random-effects SD network plots  
+
+**All results are reported directly in this HTML file (no files are written to disk).**
+
+> **Input file:** Update the Excel filename in **Step 2** if needed (Low/Medium/High frequency).  
+> Adapted from the attached script. fileciteturn0file0
+
+---
+
+## Step 1 — Packages
+
+```{r packages}
+library(dplyr)
+library(readxl)
+library(mlVAR)
+library(qgraph)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(esmtools)
+library(naniar)
+library(tibble)
+library(here)
+```
+
+---
+
+## Step 2 — Paths and data import
+
+```{r paths-data}
+data_dir <- here::here("data")
+
+####################################
+####################################
+# IMPORTANT: set input data here (Low_freq / Medium_freq / High_freq)
+input_file <- file.path(data_dir, "High_freq.xlsx")
+stopifnot(file.exists(input_file))
+####################################
+####################################
+
+df <- read_excel(input_file) %>%
+  rename(beep = Timepoint, day = Day_nr, id = ID)
+
+df$id <- as.character(df$id)
+
+vars <- c("CD", "CA", "SA", "Self_Control", "Stress")
+
+# Ensure Date_Time is POSIXct
+df$Date_Time <- as.POSIXct(df$Date_Time)
+
+# Convert all target variables to numeric
+df <- df %>%
+  mutate(across(all_of(vars), ~ as.numeric(.)))
+
+# Quick sanity check
+dplyr::glimpse(df)
+```
+
+---
+
+## Step 3 — Descriptive statistics
+
+```{r descriptives}
+summary_df <- df %>%
+  select(id, all_of(vars)) %>%
+  pivot_longer(cols = all_of(vars), names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(
+    mean = mean(Value, na.rm = TRUE),
+    sd   = sd(Value, na.rm = TRUE),
+    min  = min(Value, na.rm = TRUE),
+    max  = max(Value, na.rm = TRUE),
+    n    = n_distinct(id[!is.na(Value)]),
+    .groups = "drop"
+  ) %>%
+  mutate(range = paste0(min, " – ", max)) %>%
+  select(Variable, mean, sd, range, n)
+
+summary_df
+```
+
+---
+
+## Step 4 — Variable distributions (per-participant average)
+
+This section:
+1) Computes per-participant mean score for each variable  
+2) Displays one plot per variable (inline)
+
+```{r distributions}
+avg_scores <- df %>%
+  group_by(id) %>%
+  summarise(across(all_of(vars), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_longer(cols = -id, names_to = "Variable", values_to = "Mean_Score")
+
+avg_scores$Variable <- factor(avg_scores$Variable, levels = vars)
+
+for (v in levels(avg_scores$Variable)) {
+  p <- ggplot(avg_scores %>% filter(Variable == v), aes(x = Variable, y = Mean_Score, label = id)) +
+    geom_text(size = 3.5, position = position_jitter(width = 0.15, height = 0)) +
+    theme_bw(base_size = 14) +
+    labs(title = paste("Per-Participant Average:", v), y = "Average Score", x = NULL) +
+    scale_y_continuous(limits = if (v %in% c("CD", "Self_Control", "Stress")) c(0, 100) else NULL)
+
+  print(p)
+}
+```
+
+---
+
+## Step 5 — Within-person trajectories (first 5 participants)
+
+```{r trajectories}
+df_long <- df %>%
+  select(id, beep, all_of(vars)) %>%
+  pivot_longer(cols = all_of(vars), names_to = "Variable", values_to = "Score") %>%
+  filter(!is.na(Score)) %>%
+  group_by(id, Variable) %>%
+  arrange(beep) %>%
+  mutate(Timepoint = row_number()) %>%
+  ungroup()
+
+plot_group <- function(participant_id, vars_subset, title_suffix) {
+  df_sub <- df_long %>% filter(id == participant_id, Variable %in% vars_subset)
+  ggplot(df_sub, aes(x = Timepoint, y = Score, color = Variable)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    theme_bw(base_size = 14) +
+    labs(
+      title = paste("Participant", participant_id, "-", title_suffix),
+      x = "Assessment",
+      y = "Score",
+      color = "Variable"
+    ) +
+    theme(legend.position = "right")
+}
+
+participants_5 <- head(unique(df$id), 5)
+participants_5
+
+for (participant in participants_5) {
+  print(plot_group(participant, c("CD", "Self_Control", "Stress"), "Craving Degree / Self Control / Stress"))
+  print(plot_group(participant, c("CA", "SA"), "Craving Amount / Snacking Amount"))
+}
+```
+
+---
+
+## Step 6 — Calendar plots (assessment timing)
+
+```{r calendar-plots}
+print(heatcalendar_plot(df, "Date_Time"))
+print(calendar_plot(df, "Date_Time"))
+```
+
+---
+
+## Step 7 — Missingness diagnostics
+
+```{r missingness}
+print(
+  vis_miss(df) +
+    theme(axis.text.x = element_text(size = 9, angle = 80))
+)
+
+miss_var_summary(df)
+
+print(gg_miss_case(df))
+print(gg_miss_upset(df[, c("CD", "CA", "SA", "Self_Control", "Stress")], nsets = 5))
+```
+
+---
+
+## Step 8 — Stationarity check with detrending
+
+```{r detrending}
+cat("\n===== STATIONARITY CHECK (Detrending) =====\n")
+
+detrends <- data.frame(matrix(ncol = length(vars), nrow = length(unique(df$id))))
+colnames(detrends) <- vars
+rownames(detrends) <- as.character(unique(df$id))
+
+excluded_detrend <- data.frame(
+  id = character(),
+  variable = character(),
+  reason = character(),
+  stringsAsFactors = FALSE
+)
+
+for (current_id in unique(df$id)) {
+  row_indices <- which(df$id == current_id)
+  pp <- df[row_indices, ]
+
+  for (current_var in vars) {
+    values <- pp[[current_var]]
+    complete_cases <- complete.cases(values, pp$Date_Time)
+
+    if (sum(complete_cases) == 0) next
+
+    if (length(unique(values[complete_cases])) <= 1) {
+      excluded_detrend <- rbind(excluded_detrend, data.frame(
+        id = current_id, variable = current_var, reason = "No variance"
+      ))
+      next
+    }
+
+    if (sum(complete_cases) < 20) {
+      excluded_detrend <- rbind(excluded_detrend, data.frame(
+        id = current_id, variable = current_var, reason = "Too few observations (< 20)"
+      ))
+      next
+    }
+
+    fit <- lm(values[complete_cases] ~ pp$Date_Time[complete_cases])
+
+    if (anova(fit)$`Pr(>F)`[1] < 0.05) {
+      detrends[as.character(current_id), current_var] <- 1
+      residuals_adjusted <- residuals(fit) + mean(values[complete_cases], na.rm = TRUE)
+      df[row_indices[complete_cases], current_var] <- residuals_adjusted
+    } else {
+      detrends[as.character(current_id), current_var] <- 0
+    }
+  }
+}
+
+detrends_summary <- as.data.frame(detrends) %>%
+  rownames_to_column("id") %>%
+  pivot_longer(cols = all_of(vars), names_to = "variable", values_to = "detrended") %>%
+  filter(detrended == 1)
+
+detrends_summary
+```
+
+---
+
+## Step 9 — Exclusions: participants with < 20 observations per variable
+
+```{r exclusions-missing}
+obs_summary <- df %>%
+  pivot_longer(all_of(vars), names_to = "variable", values_to = "value") %>%
+  group_by(id, variable) %>%
+  summarise(n_obs = sum(!is.na(value)), .groups = "drop")
+
+excluded_few_obs <- obs_summary %>%
+  filter(n_obs < 20) %>%
+  distinct(id) %>%
+  pull(id)
+
+excluded_missing <- data.frame(id = excluded_few_obs)
+
+cat("Excluding", length(excluded_few_obs),
+    "participant(s) with <20 observations on at least one variable.\n")
+
+df <- df %>% filter(!id %in% excluded_few_obs)
+
+excluded_missing
+```
+
+---
+
+## Step 10 — Zero-variance check (flagged)
+
+```{r zero-variance}
+zero_var_summary <- df %>%
+  group_by(id) %>%
+  summarise(
+    across(all_of(vars), ~ var(.x, na.rm = TRUE), .names = "var_{.col}"),
+    .groups = "drop"
+  )
+
+excluded_zero_var <- zero_var_summary %>%
+  pivot_longer(starts_with("var_"), names_to = "variable", values_to = "variance") %>%
+  mutate(variable = sub("^var_", "", variable)) %>%
+  filter(variance == 0)
+
+cat("Identified", nrow(excluded_zero_var),
+    "zero-variance variable(s) across participants.\n")
+
+excluded_zero_var
+```
+
+---
+
+## Step 11 — Estimate networks with `mlVAR`
+
+```{r mlvar}
+vars <- c("CD", "CA", "SA", "Self_Control", "Stress")
+var_labels <- c("Craving Degree", "Craving Amount", "Snacking Amount", "Self-Control", "Stress")
+
+mlVAR_res <- mlVAR(
+  df,
+  vars = vars,
+  idvar = "id",
+  dayvar = "day",
+  beepvar = "beep",
+  estimator = "lmer"
+)
+
+cont <- getNet(mlVAR_res, "contemporaneous", nonsig = "hide", rule = "and")
+temp <- getNet(mlVAR_res, "temporal", nonsig = "hide")
+bet  <- getNet(mlVAR_res, "between", nonsig = "hide", rule = "and")
+
+# Random effects SD networks (temporal & contemporaneous)
+SD_temp    <- getNet(mlVAR_res, "temporal", SD = TRUE, lag = 1, partial = FALSE)
+SD_contemp <- getNet(mlVAR_res, "contemporaneous", SD = TRUE, partial = FALSE)
+```
+
+---
+
+## Step 12 — Network plots (all inline, consistent circular layout)
+
+Order:
+1) Contemporaneous  
+2) Temporal  
+3) Between-subject (BS)  
+4) Random-effects contemporaneous (SD)  
+5) Random-effects temporal (SD)
+
+```{r network-plots, fig.width=8, fig.height=8}
+# Helper for consistent styling (main networks)
+plot_qgraph_circular <- function(net, title) {
+  qgraph(
+    net,
+    layout = "circular",
+    repulsion = 1.5,
+    theme = "colorblind",
+    labels = var_labels,
+    label.scale.equal = TRUE,
+    vsize = 11,
+    label.cex = 2.3,
+    asize = 4.5,
+    border.width = 3,
+    border.color = "gray35",
+    edge.labels = TRUE,
+    edge.label.cex = 1,
+    edge.label.position = 0.5,
+    fade = FALSE,
+    mar = c(6, 6, 6, 6),
+    color = ifelse(vars %in% c("CD", "CA", "SA"), "lightyellow", "lightblue"),
+    title = title
+  )
+}
+
+# Helper for random-effects SD networks (same layout, but GREY edges)
+plot_qgraph_circular_grey_edges <- function(net, title) {
+  qgraph(
+    net,
+    layout = "circular",
+    repulsion = 1.5,
+    theme = "colorblind",
+    labels = var_labels,
+    label.scale.equal = TRUE,
+    vsize = 11,
+    label.cex = 2.3,
+    asize = 4.5,
+    border.width = 3,
+    border.color = "gray35",
+    edge.labels = TRUE,
+    edge.label.cex = 1,
+    edge.label.position = 0.5,
+    fade = FALSE,
+    edge.color = "gray",
+    mar = c(6, 6, 6, 6),
+    color = ifelse(vars %in% c("CD", "CA", "SA"), "lightyellow", "lightblue"),
+    title = title
+  )
+}
+
+plot_qgraph_circular(cont, "Contemporaneous Network")
+plot_qgraph_circular(temp, "Temporal Network")
+plot_qgraph_circular(bet,  "Between-Subjects (BS) Network")
+
+plot_qgraph_circular_grey_edges(SD_contemp, "Random Effects (SD) — Contemporaneous")
+plot_qgraph_circular_grey_edges(SD_temp,    "Random Effects (SD) — Temporal")
+```
+
+---
+
+## Knit this document to HTML
+
+In RStudio, click **Knit**.
+
+From the console you can also run:
+
+```r
+rmarkdown::render("Networks_step_by_step_first5_inlineAll_noFiles_greyREedges.Rmd",
+                  output_format = "html_document")
+```
